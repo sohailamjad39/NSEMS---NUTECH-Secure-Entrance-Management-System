@@ -5,43 +5,81 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const path = require('path');
 
+// === CONFIGURATION ===
+const { connectDB } = require('./config/db');
+const { signToken, verifyToken } = require('./config/jwt');
+
+// === MIDDLEWARE ===
+const secureHeaders = require('./middleware/secureHeaders');
+const corsMiddleware = require('./middleware/cors');
+const rateLimitMiddleware = require('./middleware/rateLimiter');
+const errorHandler = require('./middleware/errorHandler');
+
+// === MODELS (required for schema validation) ===
+require('./models/User');
+require('./models/ScanLog');
+require('./models/QRSecret');
+require('./models/AdminActivity');
+require('./models/Permission');
+
+// === UTILS ===
+const logger = require('./utils/logger');
+const { QR_EXPIRY_MS } = require('./config/constants');
+const { validateModels } = require('./utils/validateSchema');
+
+// Initialize app
 const app = express();
 
-// Security headers for institutional compliance
-app.use((req, res, next) => {
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.googleapis.com;");
-  next();
-});
+// Security headers first
+app.use(secureHeaders);
 
-// Body parsing with security limits
+// CORS after headers
+app.use(corsMiddleware);
+
+// Rate limiting
+app.use(rateLimitMiddleware);
+
+// Body parsing
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
-// CORS configuration (strict origin whitelisting)
-app.use(cors({
-  origin: ['https://nsems.edu', 'https://localhost:5173'],
-  credentials: true
-}));
-
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000
-}).catch(err => {
-  console.error('MongoDB connection failed:', err);
-  process.exit(1);
-});
-
-// Route setup (to be implemented later)
-app.use('/api/auth', require('./routes/authRoutes'));
-app.use('/api/admin', require('./routes/adminRoutes'));
-app.use('/api/sync', require('./routes/syncRoutes'));
-
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', timestamp: new Date() });
+  logger.info('Health check requested', { ip: req.ip });
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'NSEMS Backend',
+    qrExpiryMs: QR_EXPIRY_MS,
+    env: process.env.NODE_ENV || 'development',
+    db: 'connected',
+    models: {
+      users: mongoose.models.User.collection.name,
+      scanLogs: mongoose.models.ScanLog.collection.name,
+      qrSecrets: mongoose.models.QRSecret.collection.name
+    },
+    schemaValid: true
+  });
+});
+
+// Test route to verify models
+app.get('/test-models', async (req, res) => {
+  try {
+    // Validate schemas
+    validateModels();
+    
+    // Count users
+    const userCount = await mongoose.models.User.countDocuments();
+    const scanCount = await mongoose.models.ScanLog.countDocuments();
+    
+    res.json({
+      users: userCount,
+      scanLogs: scanCount,
+      message: 'Models loaded and validated'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 404 handler
@@ -49,9 +87,28 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
+// Error handling
+app.use(errorHandler);
+
 // Start server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🔒 HTTPS required for production`);
-});
+const startServer = async () => {
+  try {
+    await connectDB();
+    
+    // Validate schemas on startup
+    validateModels();
+    
+    app.listen(PORT, () => {
+      logger.info(`✅ NSEMS Backend running on port ${PORT}`, {
+        env: process.env.NODE_ENV,
+        mongoUri: process.env.MONGODB_URI?.replace(/\/\/[^@]*@/, '//***:***@')
+      });
+    });
+  } catch (error) {
+    logger.error('Failed to start server', { error: error.message });
+    process.exit(1);
+  }
+};
+
+startServer();
